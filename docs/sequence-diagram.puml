@@ -1,0 +1,136 @@
+@startuml
+autonumber
+title eOverdrachtV1 sender interop /w eOverdracht2025
+
+box Sender on eOverdrachtV1
+    actor SenderCareGiver as "Care Giver"
+    participant SenderXIS as "XIS"
+    participant SenderProxy as "eOverdracht2025 Nuts Proxy"
+    participant SenderNuts as "Nuts Node"
+end box
+box Receiver on eOverdracht2025
+    participant ReceiverNuts as "Nuts Node"
+    participant ReceiverXIS as "XIS"
+end box
+
+group Preparation
+SenderCareGiver -> SenderXIS : Prepare\npatient transfer
+activate SenderXIS
+    SenderXIS -> SenderProxy : Search for care organizations\n/internal/didman/v1/search/organizations\n(query=name, didServiceType=eOverdracht-receiver)
+    activate SenderProxy
+        SenderProxy -> SenderNuts : Search for care organizations on Nuts Network\n/internal/didman/v1/search/organizations\n(query=name, didServiceType=eOverdracht-receiver)
+        SenderNuts --> SenderProxy : Search results
+        SenderProxy -> SenderNuts : Search for care organizations on Discovery Service\n/internal/discovery/v1/eOverdracht2025\n(name)
+        note left : TBD 1 or 2 Discovery Services for eOverdracht,\nor how to encode sender/receiver in the registration.
+        SenderNuts --> SenderProxy : Search results
+        note left: Normalize results from Discovery Service:\n- resolve DID documents\n- convert endpoints to DID document services
+        SenderProxy --> SenderXIS : Search results
+    deactivate SenderProxy
+deactivate SenderXIS
+end group
+
+group Authorization Registration
+SenderCareGiver -> SenderXIS : Start\npatient transfer\n(receiverDID)
+activate SenderXIS
+    SenderXIS -> SenderProxy : Register etransfer authorization\n/internal/vcr/v2/issuer/vc
+    activate SenderProxy
+        SenderProxy -> SenderNuts : Register etransfer authorization\n/internal/vcr/v2/issuer/vc
+        note left: If credentialSubject.id is a did:web DID,\ndon't publish it; set publishToNetwork to false.
+        activate SenderNuts
+            SenderNuts --> SenderProxy : OK
+        deactivate SenderNuts
+        SenderProxy --> SenderXIS : OK
+    deactivate SenderProxy
+end group
+
+group Notify
+    SenderXIS -> SenderProxy : Find task notification endpoint\n/internal/didman/v1/did/{receiverDID}/\ncompoundservice/eOverdracht-receiver/\n/endpoint/notification
+    activate SenderProxy
+        alt If receiver is did:web DID
+        SenderProxy -> SenderNuts : Find FHIR notification URL in Discovery Service\n/internal/discovery/v1/eOverdracht2025\n(did)
+            activate SenderNuts
+                SenderNuts --> SenderProxy : OK
+            deactivate SenderNuts
+        end alt
+        alt If receiver is did:nuts DID
+            SenderProxy -> SenderNuts : Forward
+            activate SenderNuts
+                SenderNuts --> SenderProxy : OK
+            deactivate SenderNuts
+        end alt
+            SenderProxy --> SenderXIS : FHIR notification URL
+        deactivate SenderProxy
+        SenderXIS -> SenderProxy : Request Access Token\n/internal/auth/v1/request-access-token\n(requesterDID, authorizerDID, scope)
+        activate SenderProxy
+            alt If receiver is did:web DID
+                SenderProxy -> SenderNuts : Find authServerURL in Discovery Service\n/internal/discovery/v1/eOverdracht2025\n(did)
+                activate SenderNuts
+                    SenderNuts --> SenderProxy : OK
+                deactivate SenderNuts
+                SenderProxy -> SenderNuts : Request Access Token\n/internal/auth/v2/{receiverDID}
+                note left: Only works if subjectID == receiverDID,\nwhich is the default migration.\nOtherwise, the subject needs to be looked up.
+                activate SenderNuts
+                    SenderNuts -> ReceiverNuts : Create Access Token\n/oauth2/{subjectID}/token\n(token_type=bearer)
+                    note left: DPoP is not supported without\nadditional changes in calling XIS.
+                    activate ReceiverNuts
+                        ReceiverNuts --> SenderNuts : Access Token
+                    deactivate ReceiverNuts
+                    SenderNuts --> SenderProxy : Access Token
+                deactivate SenderNuts
+            end alt
+                alt If receiver is did:nuts DID (eOverdrachtV1 applies)
+                    SenderProxy -> SenderNuts : Forward
+                    activate SenderNuts
+                        SenderNuts --> SenderProxy : Access Token
+                        SenderNuts -> ReceiverNuts : Create Access Token\n/n2n/auth/v1/accesstoken
+                        activate ReceiverNuts
+                            ReceiverNuts --> SenderNuts : Access Token
+                        deactivate ReceiverNuts
+                        SenderNuts --> SenderProxy : Access Token
+                    deactivate SenderNuts
+                end alt
+        deactivate SenderProxy
+    deactivate SenderProxy
+    SenderXIS -> ReceiverXIS : Notify\n(access token)
+    activate ReceiverXIS
+        ReceiverXIS -> ReceiverNuts : Validate\n(access token)
+        activate ReceiverNuts
+            ReceiverNuts --> ReceiverXIS : OK
+        deactivate ReceiverNuts
+        ReceiverXIS --> SenderXIS : OK
+    deactivate ReceiverXIS
+deactivate SenderXIS
+end group
+
+group Retrieve eTransfer
+    group Endpoint authorization
+        SenderNuts <-> ReceiverNuts : Negotiate did:web\n/ v6 access token
+    end group
+    ReceiverXIS -> SenderXIS : Read FHIR resource\n(access token)
+    activate SenderXIS
+        SenderXIS -> SenderProxy : Introspect Access Token\n/internal/auth/v1/introspect\n(access token, request URI)
+        note right : XIS needs to provide request URI as header\nso proxy can look up NutsAuthzCredential.
+        activate SenderProxy
+            activate SenderNuts
+                alt if access token is a JWT -> did:nuts
+                    SenderProxy -> SenderNuts : Forward
+                    SenderNuts --> SenderProxy : OK
+                end alt
+                alt if otherwise -> did:web
+                    SenderProxy -> SenderNuts : Introspect Access Token\n/internal/auth/v2/accesstoken/introspect\n(access token)
+                    SenderNuts --> SenderProxy : OK
+                    SenderProxy -> SenderNuts : Find issued NutsAuthzCredentials\n/internal/vcr/v2/issuer/vc/search\n(issuerDID, subjectDID)
+                    note right : Alternatively, /internal/vcr/v2/search\ncan be used for better performance
+                    SenderNuts --> SenderProxy : Search results
+                    SenderProxy -> SenderProxy : Build auth v1 introspection response
+                end alt
+            deactivate SenderNuts
+            SenderProxy --> SenderXIS : Introspection result
+        deactivate SenderProxy
+end group
+
+
+
+
+
+@enduml
